@@ -1,0 +1,6 @@
+thread-*/
+reports/
+test-results/
+playwright-report/
+node_modules/
+package-lock.json

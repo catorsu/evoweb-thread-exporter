@@ -1,0 +1,14 @@
+# Thread exports and local audit reports.
+/thread-*/
+/reports/
+
+# Development dependencies and generated test output.
+node_modules/
+/test-results/
+/playwright-report/
+*.log
+
+# Operating system metadata.
+.DS_Store
+Thumbs.db
+Desktop.ini

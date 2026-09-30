@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Evo-Web Thread Exporter",
+  "version": "2.3.2",
+  "minimum_chrome_version": "116",
+  "description": "Export Evo-Web threads and native attachments, including Cloudflare R2 storage.",
+  "permissions": ["scripting"],
+  "host_permissions": ["https://evoweb.uk/*", "https://*.r2.cloudflarestorage.com/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "Open Evo-Web exporter on this thread" },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src https://evoweb.uk https://*.r2.cloudflarestorage.com"
+  }
+}
