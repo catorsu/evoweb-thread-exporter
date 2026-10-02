@@ -1,6 +1,6 @@
 /*
  * Evo-Web Thread Exporter: thread extraction, folder access, and report writing.
- * Runs in the extension's isolated content-script context after transport.js.
+ * Runs in the extension's isolated content-script context after safety.js and transport.js.
  *
  * Only same-origin, recognized XenForo attachment routes are fetched as files.
  * Attachments stream through the background worker using extension host permissions.
@@ -32,6 +32,11 @@
     return;
   }
   const VERSION = chrome.runtime.getManifest().version;
+  const safety = globalThis.evoAttachmentSafety;
+  if (!safety) {
+    console.error("Attachment security checks are unavailable. Reload the extension and page.");
+    return;
+  }
   if (window[KEY]?.running || window[KEY]?.busy) {
     console.warn(
       "An exporter is busy. Finish the open picker/permission dialog, or stop the current export first.",
@@ -623,7 +628,11 @@
           /* Keep the original failure. */
         }
       }
-      const original = controller.signal.aborted ? controller.signal.reason || cause : cause;
+      const original = cause?.securityDiagnostic
+        ? cause
+        : controller.signal.aborted
+          ? controller.signal.reason || cause
+          : cause;
       let message = original?.message || String(original);
       if (stage === "fetch" && original?.name === "TypeError" && kind === "attachment") {
         message +=
@@ -631,14 +640,17 @@
       }
       const error = new Error(message, { cause: original });
       error.name = original?.name || "Error";
+      if (original?.securityDiagnostic) error.securityDiagnostic = original.securityDiagnostic;
       error.requestInfo = {
         time: new Date().toISOString(),
         kind,
-        stage,
+        stage: error.securityDiagnostic ? "security-check" : stage,
         requestedUrl: u.href,
-        finalUrl: response?.url || null,
-        redirected: response ? !!response.redirected : null,
-        httpStatus: response?.status ?? null,
+        finalUrl: response?.url || original?.responseInfo?.finalUrl || null,
+        redirected: response ? !!response.redirected : (original?.responseInfo?.redirected ?? null),
+        httpStatus: response?.status ?? original?.responseInfo?.httpStatus ?? null,
+        contentType:
+          response?.headers.get("content-type") ?? original?.responseInfo?.contentType ?? null,
         challenged: response?.headers.get("cf-mitigated") === "challenge",
         error: `${error.name}: ${error.message}`,
       };
@@ -699,6 +711,8 @@
       dir,
       filename,
       committed = false;
+    const buffers = [];
+    item.path = null;
     try {
       await request(item.url, "attachment", async (response) => {
         item.finalUrl = response.url || null;
@@ -708,12 +722,17 @@
           .split(";")[0]
           .trim()
           .toLowerCase();
-        // Fail closed on HTML, including login/error/challenge pages.
-        if (/^(text\/html|application\/xhtml\+xml)$/.test(item.contentType)) {
-          await response.body?.cancel();
-          throw new Error("HTML response rejected; this may be a login/error/challenge page.");
-        }
         filename = attachmentName(item, response);
+        safety.checkMetadata({
+          headers: response.headers,
+          requestedUrl: item.url,
+          finalUrl: response.url,
+          filenames: [
+            { name: item.nameHint, source: "forum-filename" },
+            { name: stem, source: "forum-route" },
+            { name: filename, source: "local-filename" },
+          ],
+        });
         if (
           !CONFIG.DOWNLOAD_AUDIO_VIDEO &&
           (/^(audio|video)\//.test(item.contentType) || isAudioVideoName(filename))
@@ -725,71 +744,81 @@
         }
         if (!response.body) throw new Error("No response stream");
         reader = response.body.getReader();
-        const prefix = [];
-        let prefixLength = 0;
-        while (prefixLength < 1024) {
+        const scanner = safety.createScanner();
+        const signal = state.activeController.signal;
+        const ensureActive = () => {
+          checkStop();
+          signal.throwIfAborted();
+        };
+        let used = 0;
+        while (true) {
+          ensureActive();
           const chunk = await reader.read();
+          ensureActive();
           if (chunk.done) break;
-          prefix.push(chunk.value);
-          prefixLength += chunk.value.length;
+          scanner.push(chunk.value);
+          // Fixed-size buffers also bound allocation overhead for tiny network chunks.
+          let offset = 0;
+          while (offset < chunk.value.length) {
+            if (!buffers.length || used === 65536) {
+              buffers.push(new Uint8Array(65536));
+              used = 0;
+            }
+            const part = chunk.value.subarray(offset, offset + 65536 - used);
+            buffers[buffers.length - 1].set(part, used);
+            used += part.length;
+            offset += part.length;
+          }
         }
-        const sniff = new Uint8Array(Math.min(prefixLength, 1024));
-        let offset = 0;
-        for (const chunk of prefix) {
-          const part = chunk.subarray(0, sniff.length - offset);
-          sniff.set(part, offset);
-          offset += part.length;
-          if (offset === sniff.length) break;
-        }
-        if (
-          /^\s*(?:<!doctype\s+html|<html\b|<head\b|<body\b)/i.test(new TextDecoder().decode(sniff))
-        ) {
-          throw new Error("HTML-looking response rejected, despite its MIME type.");
-        }
+        item.securityCheck = scanner.finish();
+        ensureActive();
+        // No file handle or writable stream exists until the entire body passes.
+        // createWritable() can stage data on disk even before close().
         item.category = category(filename, item.contentType);
         const parts = ["posts", `post-${post.key}`, item.category];
         dir = await directory(parts);
         const handle = await dir.getFileHandle(filename, { create: true });
         stream = await handle.createWritable();
-        let bytes = 0;
-        for (const chunk of prefix) {
-          checkStop();
-          await stream.write(chunk);
-          bytes += chunk.length;
+        for (let i = 0; i < buffers.length; i++) {
+          ensureActive();
+          await stream.write(i === buffers.length - 1 ? buffers[i].subarray(0, used) : buffers[i]);
         }
-        while (true) {
-          checkStop();
-          const chunk = await reader.read();
-          if (chunk.done) break;
-          await stream.write(chunk.value);
-          bytes += chunk.value.length;
-        }
+        ensureActive();
         // Only after the write is committed may the report claim a local path.
         await stream.close();
         committed = true;
         item.status = "saved";
         item.path = [rootName, ...parts, filename].join("/");
         item.filename = filename;
-        item.bytes = bytes;
+        item.bytes = item.securityCheck.bytesInspected;
       });
     } catch (e) {
       const unavailable =
         e.requestInfo?.stage === "validate-response" &&
         [404, 410].includes(e.requestInfo.httpStatus) &&
         !e.requestInfo.challenged;
-      item.status = state.stopRequested ? "cancelled" : unavailable ? "unavailable" : "failed";
+      item.status = e.securityDiagnostic
+        ? "security-blocked"
+        : state.stopRequested
+          ? "cancelled"
+          : unavailable
+            ? "unavailable"
+            : "failed";
+      if (e.securityDiagnostic) item.securityDiagnostic = e.securityDiagnostic;
       item.error = `${e.name}: ${e.message}`;
       if (e.requestInfo) {
         item.requestDiagnostic = e.requestInfo;
         item.finalUrl = e.requestInfo.finalUrl;
         item.redirected = e.requestInfo.redirected;
         item.httpStatus = e.requestInfo.httpStatus;
+        item.contentType = (e.requestInfo.contentType || "").split(";")[0].trim().toLowerCase();
       }
       (unavailable ? console.log : console.warn)(
         `Attachment ${item.id} [${item.status}]: ${item.error}`,
         item.requestDiagnostic || { requestedUrl: item.url },
       );
     } finally {
+      buffers.length = 0;
       if (reader) {
         try {
           await reader.cancel();
@@ -802,12 +831,16 @@
         if (stream) {
           try {
             await stream.abort();
-          } catch {}
+          } catch (e) {
+            item.cleanupError = `Could not abort partial write: ${e.name}: ${e.message}`;
+          }
         }
         if (dir && filename) {
           try {
             await dir.removeEntry(filename);
-          } catch {}
+          } catch (e) {
+            item.cleanupError = `${item.cleanupError ? item.cleanupError + "; " : ""}Could not remove partial file ${filename}: ${e.name}: ${e.message}`;
+          }
         }
       }
     }
@@ -818,11 +851,16 @@
     const count = (status) => attachments.filter((a) => a.status === status).length;
     const attachmentIssues = attachments.filter(
       (a) =>
-        !["saved", "unavailable", "quoted-reference-only", "media-reference-only"].includes(
-          a.status,
-        ),
+        ![
+          "saved",
+          "unavailable",
+          "security-blocked",
+          "quoted-reference-only",
+          "media-reference-only",
+        ].includes(a.status),
     ).length;
     const unavailableAttachments = count("unavailable");
+    const blockedAttachments = count("security-blocked");
     const warnings = report.posts.some((p) => p.warnings.length);
     report.status = report.haltReason
       ? "stopped-partial"
@@ -831,12 +869,15 @@
           attachmentIssues ||
           warnings
         ? "finished-with-errors-or-gaps"
-        : unavailableAttachments
-          ? "finished-with-unavailable-attachments"
-          : "finished";
+        : blockedAttachments
+          ? "finished-with-blocked-attachments"
+          : unavailableAttachments
+            ? "finished-with-unavailable-attachments"
+            : "finished";
     report.summary = {
       savedAttachments: count("saved"),
       unavailableAttachments,
+      blockedAttachments,
       attachmentIssues,
       skippedMediaAttachments: count("media-reference-only"),
       quotedReferences: count("quoted-reference-only"),
@@ -863,6 +904,9 @@
       `Quoted attachment downloads enabled: ${CONFIG.DOWNLOAD_QUOTED_ATTACHMENTS}`,
       "Embedded players are references only; video/audio files are excluded by default.",
       "HTTP 404/410 attachments are recorded as unavailable, separately from export failures.",
+      `Attachment security policy: ${safety.policy.id}; inspection limit: ${safety.policy.maxBytes} bytes.`,
+      "Security-blocked files are not saved. Basic checks are not antivirus certification; archive contents are not inspected.",
+      `Security-blocked attachments: ${report.posts.flatMap((p) => p.attachments).filter((a) => a.status === "security-blocked").length}`,
       "=".repeat(72),
       "",
     ];
@@ -903,6 +947,9 @@
         if (a.requestDiagnostic) lines.push(`  Failure stage: ${a.requestDiagnostic.stage}`);
         if (a.status === "saved") lines.push(`  Category: ${a.category}; bytes: ${a.bytes}`);
         if (a.error) lines.push(`  Error: ${a.error}`);
+        if (a.securityDiagnostic)
+          lines.push(`  Security diagnostic: ${JSON.stringify(a.securityDiagnostic)}`);
+        if (a.cleanupError) lines.push(`  Cleanup error: ${a.cleanupError}`);
         if (a.skipReason) lines.push(`  Skipped: ${a.skipReason}`);
       }
       for (const [heading, items] of [
@@ -930,6 +977,14 @@
     lines.push("--- Export diagnostics ---", ...report.errors.map((e) => JSON.stringify(e)));
     if (report.haltReason) lines.push(`Stopped: ${report.haltReason}`);
     return "\uFEFF" + lines.join("\n");
+  }
+  function completionStatus(report) {
+    return (
+      `${report.status}: ${report.posts.length} posts, ${report.summary.savedAttachments} files, ` +
+      `${report.summary.unavailableAttachments} unavailable, ${report.summary.attachmentIssues} failed/incomplete attachments. ` +
+      `${report.summary.blockedAttachments} security-blocked. ` +
+      `Reports: ${rootName}/thread.txt and manifest.json`
+    );
   }
   async function checkpoint() {
     const r = state.report;
@@ -1237,6 +1292,7 @@
       pathBase: "selected-directory",
       config: { ...CONFIG },
       attachmentTransport: state.transport,
+      attachmentSecurity: { ...safety.policy, archiveContentsInspected: false },
       directoryAccess: { mode: "readwrite", permission: state.permission, writeTestPassed: false },
       maxPage: Math.max(THREAD.page, discoverMaxPage(document, location.href)),
       pagesOK: [],
@@ -1260,10 +1316,11 @@
     report.status = "running";
     refreshControls();
     const seen = new Set();
+    let blockedAttachments = 0;
     try {
       for (let p = 1; p <= Math.min(report.maxPage, CONFIG.MAX_PAGES); p++) {
         checkStop();
-        status.textContent = `Page ${p}/${report.maxPage}; ${report.posts.length} posts exported`;
+        status.textContent = `Page ${p}/${report.maxPage}; ${report.posts.length} posts exported; ${blockedAttachments} security-blocked`;
         const base = pageURL(p);
         let pagePosts;
         try {
@@ -1313,8 +1370,12 @@
           for (const attachment of post.attachments) {
             checkStop();
             if (attachment.status !== "pending") continue;
-            status.textContent = `Page ${p}/${report.maxPage}; post ${post.floor || post.key}; attachment ${attachment.id}`;
+            status.textContent = `Page ${p}/${report.maxPage}; post ${post.floor || post.key}; attachment ${attachment.id}; ${blockedAttachments} security-blocked`;
             await saveAttachment(attachment, post);
+            if (attachment.status === "security-blocked") {
+              blockedAttachments++;
+              status.textContent = `Attachment ${attachment.id} security-blocked: ${attachment.securityDiagnostic.reason}; ${blockedAttachments} blocked in this run.`;
+            }
           }
         }
         await checkpoint(); // Completed pages survive a later interruption.
@@ -1331,10 +1392,7 @@
       try {
         if (!rootHandle) throw new Error("No writable export directory was created");
         await checkpoint();
-        status.textContent =
-          `${report.status}: ${report.posts.length} posts, ${report.summary.savedAttachments} files, ` +
-          `${report.summary.unavailableAttachments} unavailable, ${report.summary.attachmentIssues} failed/incomplete attachments. ` +
-          `Reports: ${rootName}/thread.txt and manifest.json`;
+        status.textContent = completionStatus(report);
         console.log("Export reports saved:", report);
       } catch (e) {
         status.textContent = `Report write failed: ${e.message}. The in-memory report is window.${KEY}.report.`;

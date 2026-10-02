@@ -7,6 +7,7 @@ evoweb-exporter-extension/
   manifest.json       Extension metadata, permissions, and content security policy
   background.js       Toolbar action and download connection setup
   download.mjs        Request validation and streamed attachment downloads
+  safety.js          Shared attachment metadata, signature, and size checks
   transport.js        Isolated content-script transport and cancellation
   exporter.js         Extraction, folder access, file writing, and reports
 scripts/
@@ -28,7 +29,7 @@ npm test
 npm run format:check
 ```
 
-The tests use Node's built-in test runner, Web Streams, and a VM context. They simulate HTTP responses, Chrome message ports, and file handles to check request restrictions, file integrity, cancellation, media exclusions, unavailable attachments, and report statuses. They read the extension source directly and do not generate report files in the project root.
+The tests use Node's built-in test runner, Web Streams, and a VM context. They simulate HTTP responses, Chrome message ports, and file handles to check request restrictions, file integrity, cancellation, media exclusions, unavailable attachments, security interception, and report statuses. Security fixtures cover misleading metadata, split signatures, late EICAR detection, memory limits, cleanup, and the absence of filesystem operations before inspection completes. Test signatures are constructed in memory; no malware or EICAR files are written to disk. They read the extension source directly and do not generate report files in the project root.
 
 These tests do not exercise a live Evo-Web account, native Chrome permission dialogs, or network CORS enforcement. For browser validation, use a separate test profile and local fixtures. Verify successful downloads, cancellation, unavailable files, and media exclusions before checking a real thread. Keep generated output under `test-results/`.
 
@@ -51,3 +52,5 @@ Thread pages use same-origin requests with redirects disabled. Attachments use t
 The transport sends bounded chunks on demand and cancels the worker request when the reader or tab disconnects. Do not introduce a page-accessible message bridge, arbitrary URL fetching, or an opaque-response fallback.
 
 Treat unavailable source files separately from request and write failures. Keep diagnostics and source references even when media is intentionally excluded or a server file is unavailable.
+
+Keep `security-blocked` attachments and their diagnostics separate from both categories. `safety.js` runs in the worker and is injected before the exporter in the isolated world. The worker scans on demand; the exporter checks metadata and buffers the entire attachment up to 64 MiB before creating any attachment file handle. Do not stream unchecked bytes to a writable file, including a temporary or uncommitted stream. The basic policy does not unpack archives or replace antivirus scanning.

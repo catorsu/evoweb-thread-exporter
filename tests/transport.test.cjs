@@ -178,6 +178,141 @@ function response(options = {}) {
     await r.body.cancel();
     assert.equal(h.timers.size, 0);
   });
+  for (const headers of [
+    { "content-type": "application/x-msdownload" },
+    { "content-disposition": 'attachment; filename="picture.png.exe"' },
+    { "content-length": String(64 * 1024 * 1024 + 1) },
+  ]) {
+    await test(`Worker rejects risky metadata before sending headers: ${JSON.stringify(headers)}`, async () => {
+      let cancelled = false;
+      const body = new ReadableStream(
+        {
+          pull() {
+            throw new Error("Unsafe response must not be read");
+          },
+          cancel() {
+            cancelled = true;
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      const h = harness(() => response({ headers, body }));
+      await assert.rejects(h.fetch(NATIVE), (error) => {
+        assert.equal(error.name, "AttachmentSecurityError");
+        assert.equal(error.securityDiagnostic.policy, "basic-attachment-v1");
+        assert.equal(error.securityDiagnostic.stage, "metadata");
+        assert.equal(error.responseInfo.finalUrl, STORAGE);
+        assert.equal(error.responseInfo.httpStatus, 200);
+        return true;
+      });
+      assert.equal(cancelled, true);
+      assert.equal(
+        h.messages.some((m) => m.type === "headers" || m.type === "chunk"),
+        false,
+      );
+      assert.equal(h.disconnected, true);
+      assert.equal(h.timers.size, 0);
+    });
+  }
+  await test("Cancellation failure cannot replace the worker security diagnostic", async () => {
+    const body = new ReadableStream(
+      {
+        cancel() {
+          throw new Error("Cancellation failed");
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const h = harness(() => response({ body, headers: { "content-type": "text/javascript" } }));
+    await assert.rejects(h.fetch(NATIVE), (error) => {
+      assert.equal(error.securityDiagnostic.code, "dangerous-content-type");
+      return true;
+    });
+    assert.equal(h.timers.size, 0);
+  });
+  for (const status of [200, 404, 410, 429]) {
+    await test(`HTTP ${status} error/challenge metadata retains HTTP handling`, async () => {
+      const h = harness(() =>
+        response({
+          status,
+          headers: {
+            "content-type": "text/html",
+            ...(status === 200 ? { "cf-mitigated": "challenge" } : {}),
+          },
+        }),
+      );
+      const r = await h.fetch(NATIVE);
+      assert.equal(r.status, status);
+      await r.body.cancel();
+      assert.equal(h.timers.size, 0);
+    });
+  }
+  await test("Worker blocks a disguised executable without sending the risky chunk", async () => {
+    let cancelled = false;
+    const body = new ReadableStream(
+      {
+        pull(controller) {
+          controller.enqueue(Uint8Array.of(0x4d, 0x5a, 0, 0));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const h = harness(() => response({ body }));
+    const r = await h.fetch(NATIVE);
+    await assert.rejects(r.body.getReader().read(), (error) => {
+      assert.equal(error.name, "AttachmentSecurityError");
+      assert.equal(error.securityDiagnostic.code, "dangerous-signature");
+      assert.equal(error.securityDiagnostic.stage, "body");
+      return true;
+    });
+    await new Promise(setImmediate);
+    assert.equal(cancelled, true);
+    assert.equal(
+      h.messages.some((m) => m.type === "chunk"),
+      false,
+    );
+    assert.equal(h.disconnected, true);
+    assert.equal(h.timers.size, 0);
+  });
+  await test("Worker/client preserve a late security rejection across JSON port messages", async () => {
+    const signature = Buffer.from(
+      "X5O!P%@AP[4\\PZX54(P^)7CC)7}$" + "EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*",
+    );
+    const chunks = [Buffer.alloc(1024, 0x20), signature.subarray(0, 50), signature.subarray(50)];
+    let index = 0;
+    let cancelled = false;
+    const body = new ReadableStream(
+      {
+        pull(controller) {
+          assert.ok(index < chunks.length, "Must stop pulling after detection");
+          controller.enqueue(chunks[index++]);
+        },
+        cancel() {
+          cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const h = harness(() => response({ body }));
+    const r = await h.fetch(NATIVE);
+    const reader = r.body.getReader();
+    assert.deepEqual(Buffer.from((await reader.read()).value), chunks[0]);
+    assert.deepEqual(Buffer.from((await reader.read()).value), chunks[1]);
+    await assert.rejects(reader.read(), (error) => {
+      assert.equal(error.securityDiagnostic.code, "eicar-test-signature");
+      assert.equal(error.securityDiagnostic.offset, 1024);
+      assert.equal(error.responseInfo.finalUrl, STORAGE);
+      return true;
+    });
+    await new Promise(setImmediate);
+    assert.equal(cancelled, true);
+    assert.equal(index, 3);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.disconnected, true);
+  });
   await test("Invalid request never reaches fetch", async () => {
     const h = harness();
     await assert.rejects(h.fetch(STORAGE), /Only native/);

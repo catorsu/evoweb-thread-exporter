@@ -17,13 +17,14 @@ After updating the extension files, select **Reload** on `chrome://extensions`, 
 
 ## Export scope
 
-The exporter reads the thread's discovered pages and records each post's author, date, permalink, text, quotes, and links. Native image, archive, document, and other non-media attachments are saved when available.
+The exporter reads the thread's discovered pages and records each post's author, date, permalink, text, quotes, and links. Native image, archive, document, and other non-media attachments are saved when available and permitted by the basic security checks.
 
 - External links remain text references; their targets are not downloaded.
 - Quoted attachments remain references by default.
 - Embedded players, including YouTube, remain references. Video and audio files are excluded by default.
 - Recognized video/audio files are skipped before a request. Unknown types are cancelled when response headers identify them as video or audio.
 - HTTP 404 and 410 attachments are recorded as unavailable. They are not reported as saved files.
+- Attachments rejected by security checks are marked `security-blocked`, with a reason and diagnostics. They do not count as network failures or unavailable resources.
 
 ## Output
 
@@ -41,14 +42,25 @@ thread-<id>_<title>_<timestamp>_<run-id>/
 
 `thread.txt` is the readable report. `manifest.json` contains structured posts, file paths, statuses, and diagnostics. Paths in both reports are relative to the selected folder. Reports are updated after each page, and a file is marked saved only after its write commits.
 
-| Status                                  | Meaning                                                                         |
-| --------------------------------------- | ------------------------------------------------------------------------------- |
-| `finished`                              | The run completed without detected errors or unavailable attachments.           |
-| `finished-with-unavailable-attachments` | The run completed, but some attachments returned HTTP 404 or 410.               |
-| `finished-with-errors-or-gaps`          | A page, attachment, or extraction check failed. Inspect the report diagnostics. |
-| `stopped-partial`                       | The run stopped before completion.                                              |
+| Status                                  | Meaning                                                                                                    |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `finished`                              | The run completed without detected errors, blocked files, or unavailable attachments.                      |
+| `finished-with-blocked-attachments`     | The run completed, but security checks blocked some attachments; the report also counts unavailable files. |
+| `finished-with-unavailable-attachments` | The run completed, but some attachments returned HTTP 404 or 410.                                          |
+| `finished-with-errors-or-gaps`          | A page, attachment, or extraction check failed. Inspect the report diagnostics.                            |
+| `stopped-partial`                       | The run stopped before completion.                                                                         |
 
 Intentional media and quoted-reference exclusions do not count as errors. A `finished` status describes the export checks; it does not guarantee that every item ever posted still exists on the source site.
+
+## Attachment security checks
+
+The worker and exporter share the `basic-attachment-v1` policy. It checks original and final URL filenames, forum filename hints, response filenames (including `filename*`), MIME types, and recognizable file signatures. It blocks common executable/installable formats, scripts, shortcuts, HTML/SVG active content, macro-enabled Office types, and OLE compound files whose contents cannot be inspected. Obfuscated filenames with control or bidirectional characters are also blocked. A harmless [EICAR test signature](https://www.eicar.org/download-anti-malware-testfile/) is detected anywhere in the body, including across network chunks.
+
+Each attachment is buffered in memory and checked in full before the exporter creates a local file or writable stream. The limit is **64 MiB (67,108,864 bytes) per attachment**. A declared or actual size over this limit is blocked with `size-limit`; this means the file cannot be inspected within the memory budget, not that malware was confirmed. Blocked transfers are cancelled and buffered data is discarded. Failed or cancelled writes are aborted and partial files removed; cleanup failures are recorded.
+
+`manifest.json` and `thread.txt` retain the attachment source, `security-blocked` status, and `securityDiagnostic` with the policy, reason code, inspection stage, and relevant details. The panel and report summary count blocked files separately. Other attachments continue exporting; actual failures or a stopped run take precedence in the overall run status.
+
+These are conservative checks, **not an antivirus engine or a guarantee that saved files are safe**. Archives are not unpacked; encrypted/compressed content, document macros or exploits inside otherwise permitted containers, and unknown malware may go undetected. Prefix checks inspect the first 4 KiB; only the EICAR signature and size check cover the whole stream. No file is uploaded to a scanning service. Use a maintained antivirus scanner before opening downloaded attachments, particularly archives and documents.
 
 ## Permissions
 
@@ -63,6 +75,7 @@ See Chrome's [cross-origin network request documentation](https://developer.chro
 - **The panel does not open:** use a normal Evo-Web thread page, check extension site access, and refresh the tab after reloading the extension.
 - **HTTP 401/403 or an HTML response:** sign in and check whether the attachment opens normally on Evo-Web. Complete any site challenge in the browser.
 - **HTTP 404/410:** the attachment is unavailable at the requested endpoint. Repeated exports cannot restore a deleted server object.
+- **Security-blocked:** inspect `securityDiagnostic` in the reports. HTML may be a login/error page; sign in or complete the site challenge before retrying. Files above 64 MiB and high-risk formats are intentionally excluded; renaming a file does not make it safe.
 - **Folder access fails:** choose a writable folder and grant permission from the on-page button. Cancelled or denied permissions can be retried.
 - **A run stops or reports gaps:** inspect `manifest.json` and `thread.txt` before starting another run. Each run uses a separate directory.
 

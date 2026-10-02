@@ -1,3 +1,6 @@
+import "./safety.js";
+
+const safety = globalThis.evoAttachmentSafety;
 export const FORUM_ORIGIN = "https://evoweb.uk";
 export const PORT_NAME = "evoweb-attachment-v1";
 const CHUNK_SIZE = 64 * 1024;
@@ -84,7 +87,9 @@ export function attachDownloadPort(port, { extensionId, fetchImpl = fetch }) {
     reading = false,
     reader = null;
   let pending = null,
-    offset = 0;
+    offset = 0,
+    scanner = null,
+    responseInfo = null;
   // Independent limit also covers a disconnected or stalled content script.
   const timer = setTimeout(() => fail(new Error("Attachment transfer timed out.")), 180000);
   function send(message) {
@@ -96,12 +101,20 @@ export function attachDownloadPort(port, { extensionId, fetchImpl = fetch }) {
     clearTimeout(timer);
     controller.abort();
     reader?.cancel().catch(() => {});
+    pending = null;
+    scanner = null;
     port.onMessage.removeListener(onMessage);
     port.onDisconnect.removeListener(close);
   }
   function fail(error) {
     try {
-      send({ type: "error", name: error.name, message: error.message });
+      send({
+        type: "error",
+        name: error.name,
+        message: error.message,
+        securityDiagnostic: error.securityDiagnostic,
+        responseInfo,
+      });
     } finally {
       close();
     }
@@ -125,8 +138,27 @@ export function attachDownloadPort(port, { extensionId, fetchImpl = fetch }) {
     }
     try {
       validateFinal(response, original);
+      responseInfo = {
+        finalUrl: response.url,
+        redirected: response.redirected,
+        httpStatus: response.status,
+        contentType: response.headers.get("content-type"),
+      };
+      // Preserve HTTP/challenge handling in the exporter. Error pages are not files.
+      if (response.status === 200 && response.headers.get("cf-mitigated") !== "challenge") {
+        safety.checkMetadata({
+          headers: response.headers,
+          requestedUrl: original.url,
+          finalUrl: response.url,
+        });
+        scanner = safety.createScanner();
+      }
     } catch (e) {
-      await response.body?.cancel();
+      try {
+        await response.body?.cancel();
+      } catch {
+        // Preserve the rejection diagnostic even if cancellation also fails.
+      }
       throw e;
     }
     reader = response.body?.getReader();
@@ -160,10 +192,12 @@ export function attachDownloadPort(port, { extensionId, fetchImpl = fetch }) {
         const next = await reader.read();
         if (closed) return;
         if (next.done) {
+          scanner?.finish();
           send({ type: "end" });
           close();
           return;
         }
+        scanner?.push(next.value);
         pending = next.value;
         offset = 0;
       }

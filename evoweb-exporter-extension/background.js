@@ -17,7 +17,7 @@ chrome.action.onClicked.addListener(async (tab) => {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id, frameIds: [0] },
       world: "ISOLATED",
-      files: ["transport.js", "exporter.js"],
+      files: ["safety.js", "transport.js", "exporter.js"],
     });
     await chrome.action.setBadgeText({ tabId: tab.id, text: "" });
     await chrome.action.setTitle({

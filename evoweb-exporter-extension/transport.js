@@ -95,6 +95,8 @@
           } else if (message.type === "error") {
             const error = new Error(message.message);
             error.name = message.name || "Error";
+            if (message.securityDiagnostic) error.securityDiagnostic = message.securityDiagnostic;
+            if (message.responseInfo) error.responseInfo = message.responseInfo;
             fail(error);
           } else throw new Error("Invalid attachment response.");
         } catch (e) {
