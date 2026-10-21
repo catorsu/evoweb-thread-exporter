@@ -1,6 +1,11 @@
 {
   "name": "evoweb-thread-exporter",
-  "version": "2.3.2",
+  "version": "1.0.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/catorsu/evoweb-thread-exporter.git"
+  }
   "private": true,
   "description": "A Chrome extension for exporting Evo-Web thread text and native attachments.",
   "engines": {
